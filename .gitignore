@@ -1,0 +1,4 @@
+venv/
+*.pyc
+bulbs.json
+__pycache__/

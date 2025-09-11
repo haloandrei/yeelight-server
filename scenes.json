@@ -1,0 +1,11 @@
+{
+  "movie": [
+    {"target":"tv","cmd":"set_brightness","args":[20]},
+    {"target":"tv","cmd":"set_color_temp","args":[2700]}
+  ],
+  "focus": [
+    {"target":"office","cmd":"set_brightness","args":[90]},
+    {"target":"office","cmd":"set_color_temp","args":[5000]}
+  ]
+}
+
