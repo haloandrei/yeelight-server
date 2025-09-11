@@ -19,34 +19,122 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
-# 1) Build bulbs.json (merge seed with autodiscovery by id)
+# 1) Build bulbs.json (merge seed with autodiscovery by
+# --- helpers --------------------------------------------------------------
+
+def _index_cfg(cfg):
+    """Build quick lookups for existing config: id->name, ip->name."""
+    by_id = {}
+    by_ip = {}
+    for name, ent in cfg.items():
+        bid = ent.get("id")
+        ip  = ent.get("ip")
+        if bid: by_id[bid] = name
+        if ip:  by_ip[ip]  = name
+    return by_id, by_ip
+
+def _new_auto_name(ip=None, bid=None):
+    if bid:
+        return f"bulb_{bid[-6:]}"  # last 6 hex chars of id
+    if ip:
+        return f"bulb_{ip.replace('.', '_')}"
+    return "bulb_unknown"
+
+# --- main merge -----------------------------------------------------------
+
 def build_config():
-    seed = load_json(SEED_FILE, {})
-    cfg  = load_json(CFG_FILE, {})
-    # index existing by id/ip so we don't duplicate
-    by_id = {v.get("id"): k for k, v in cfg.items() if v.get("id")}
-    by_ip = {v.get("ip"): k for k, v in cfg.items() if v.get("ip")}
-    # start with cfg (persistent)
+    """
+    Merge seed + discovery into bulbs.json **without duplicates**.
+    Priority:
+      1) Seed names are preserved.
+      2) Discovery updates existing entries (by id, else by ip).
+      3) New devices from discovery are added with auto names.
+    """
+    seed = load_json(SEED_FILE, {})       # friendly-name -> {ip,id}
+    cfg  = load_json(CFG_FILE, {})        # runtime config
+
+    # Start from current cfg, but ensure all seed names exist (preserve names)
     merged = dict(cfg)
-    # ensure seed entries exist
     for name, ent in seed.items():
-        merged[name] = ent
-    # enrich with discovery: attach id/ip pairs
-    for b in discover_bulbs():
+        me = merged.get(name, {})
+        # Seed wins for friendly name; keep id/ip if present
+        if ent.get("id"): me["id"] = ent["id"]
+        if ent.get("ip"): me["ip"] = ent["ip"]
+        merged[name] = me
+
+    # Build indices before discovery
+    by_id, by_ip = _index_cfg(merged)
+
+    # Pull discovery results
+    disc = discover_bulbs()  # returns list of {ip, port, capabilities:{id,...}}
+    for b in disc:
         ip = b["ip"]
-        bid = b["capabilities"].get("id")
-        # if we already have this IP named, attach id
-        if ip in by_ip:
-            merged[by_ip[ip]]["id"] = bid
+        bid = b.get("capabilities", {}).get("id")
+
+        name_for_id = by_id.get(bid) if bid else None
+        name_for_ip = by_ip.get(ip)  if ip  else None
+
+        if name_for_id and name_for_ip and name_for_id != name_for_ip:
+            # Same device known under two names -> consolidate into the id-name (prefer seed)
+            keep = name_for_id
+            drop = name_for_ip
+            # Move any data from drop into keep if missing
+            kept = merged.get(keep, {})
+            dropped = merged.get(drop, {})
+            if not kept.get("ip") and dropped.get("ip"): kept["ip"] = dropped["ip"]
+            if not kept.get("id") and dropped.get("id"): kept["id"] = dropped["id"]
+            merged[keep] = kept
+            # Remove the duplicate
+            merged.pop(drop, None)
+            # Rebuild indices
+            by_id, by_ip = _index_cfg(merged)
+
+        # Re-compute names after possible consolidation
+        name = by_id.get(bid) or by_ip.get(ip)
+        if name:
+            # Update existing entry with fresh id/ip
+            ent = merged[name]
+            if bid: ent["id"] = bid
+            if ip:  ent["ip"] = ip
+            merged[name] = ent
         else:
-            # if ID exists somewhere, attach IP there
-            if bid in by_id:
-                merged[by_id[bid]]["ip"] = ip
+            # New device: give it a deterministic auto name, unless seed already had an id match
+            auto = _new_auto_name(ip, bid)
+            # Avoid collision
+            i = 1
+            base = auto
+            while auto in merged:
+                i += 1
+                auto = f"{base}_{i}"
+            merged[auto] = {"ip": ip, "id": bid}
+
+        # Keep indices fresh
+        by_id, by_ip = _index_cfg(merged)
+
+    # Final pass: ensure unique id/ip (paranoid cleanup)
+    seen_ids = {}
+    seen_ips = {}
+    to_delete = []
+    for name, ent in merged.items():
+        bid = ent.get("id")
+        ip  = ent.get("ip")
+        if bid:
+            if bid in seen_ids and seen_ids[bid] != name:
+                # keep the older (assume first is canonical); drop this duplicate
+                to_delete.append(name)
             else:
-                # unnamed bulb -> assign a temp name
-                merged.setdefault(f"bulb_{ip.replace('.','_')}", {"ip": ip, "id": bid})
+                seen_ids[bid] = name
+        if ip:
+            if ip in seen_ips and seen_ips[ip] != name:
+                to_delete.append(name)
+            else:
+                seen_ips[ip] = name
+    for name in set(to_delete):
+        merged.pop(name, None)
+
     save_json(CFG_FILE, merged)
     return merged
+
 
 CONFIG = build_config()
 GROUPS = load_json(GROUPS_FILE, {})   # e.g. {"kitchen":["kitchen_1","kitchen_2"], "tv":["tv_left","tv_right"]}
@@ -84,6 +172,28 @@ def names_or_group(target):
     return []
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def read_state_for(name):
+    """Return live Yeelight properties for a bulb name from CONFIG via BulbPool."""
+    b = BULBS.get(name)
+    if not b:
+        return None
+    try:
+        props = b.get_properties(["power", "bright", "ct", "rgb", "hue", "sat", "color_mode"])
+        # yeelight returns strings; keep them as-is so the frontend can compare 'on'/'off'
+        return {
+            "power": props.get("power"),
+            "bright": props.get("bright"),
+            "ct": props.get("ct"),
+            "rgb": props.get("rgb"),
+            "hue": props.get("hue"),
+            "sat": props.get("sat"),
+            "color_mode": props.get("color_mode"),
+        }
+    except Exception as e:
+        print(f"[warn] read_state error for {name}: {e}")
+        return None
+
 
 @app.route("/api/bulbs", methods=["GET"])
 def list_bulbs():
@@ -187,6 +297,50 @@ def pulse(target):
         if not b: continue
         b.start_flow(f)
     return jsonify({"ok": True})
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    new_cfg = build_config()
+    return jsonify({"ok": True, "count": len(new_cfg), "names": list(new_cfg.keys())})
+
+@app.route("/api/state", methods=["GET"])
+def state_all():
+    out = {}
+    for name in CONFIG.keys():
+        st = read_state_for(name)
+        if st is not None:
+            out[name] = st
+    return jsonify(out)
+
+@app.route("/api/state/<target>", methods=["GET"])
+def state_target(target):
+    # single bulb
+    if target in CONFIG:
+        st = read_state_for(target)
+        return jsonify({target: st} if st else {})
+
+    # group aggregate (tri-state info + member states)
+    if target in GROUPS:
+        members = GROUPS[target]
+        states = {}
+        any_on = False
+        all_on = True
+        any_unknown = False
+        for m in members:
+            st = read_state_for(m)
+            states[m] = st
+            if not st or st.get("power") not in ("on", "off"):
+                any_unknown = True
+                all_on = False
+            else:
+                is_on = (st["power"] == "on")
+                any_on = any_on or is_on
+                all_on = all_on and is_on
+        tri = "on" if all_on else ("off" if (not any_on and not any_unknown) else "mixed")
+        return jsonify({"group": target, "tri": tri, "members": states})
+
+    return jsonify({"error": "unknown target"}), 404
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5006)
