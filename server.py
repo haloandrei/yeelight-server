@@ -1,4 +1,5 @@
-import json, os, threading, time
+import json, os, threading, time, subprocess, socket
+from datetime import datetime
 from flask import Flask, request, jsonify
 from yeelight import Bulb, discover_bulbs, Flow, transitions
 
@@ -6,6 +7,9 @@ CFG_FILE = "bulbs.json"          # runtime config (name -> {ip,id})
 SEED_FILE = "bulbs.seed.json"    # your initial mapping
 GROUPS_FILE = "groups.json"      # optional groups
 SCENES_FILE = "scenes.json"      # optional scenes
+STATE_FILE = "state.json"        # persisted bulb state (name -> {power,bright,ct,rgb,...})
+PRESENCE_FILE = "presence.json"  # presence automation config
+ROUTINES_FILE = "routines.json"  # routine configs
 
 app = Flask(__name__)
 
@@ -18,6 +22,90 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+STATE_LOCK = threading.Lock()
+PRESENCE_LOCK = threading.Lock()
+ROUTINES_LOCK = threading.Lock()
+
+def _cmd_output(cmd):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
+    except Exception:
+        return ""
+
+def _neigh_state(ip):
+    out = _cmd_output(["ip", "neigh", "show", ip]).strip()
+    if not out:
+        return ""
+    parts = out.split()
+    return parts[-1] if parts else ""
+
+def _ping_ip(ip):
+    try:
+        res = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def _parse_time_hhmm(value):
+    if not value:
+        return None
+    parts = value.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+def _time_in_window(now_minutes, start_minutes, end_minutes):
+    if start_minutes is None or end_minutes is None:
+        return False
+    if start_minutes <= end_minutes:
+        return start_minutes <= now_minutes < end_minutes
+    # window crosses midnight
+    return now_minutes >= start_minutes or now_minutes < end_minutes
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def _rgb_int_to_list(rgb_int):
+    if rgb_int is None:
+        return None
+    return [(rgb_int >> 16) & 255, (rgb_int >> 8) & 255, rgb_int & 255]
+
+def _normalize_rgb(value):
+    if isinstance(value, list) and len(value) == 3:
+        try:
+            return [int(max(0, min(255, v))) for v in value]
+        except (TypeError, ValueError):
+            return None
+    rgb_int = _to_int(value)
+    return _rgb_int_to_list(rgb_int)
+
+def _merge_state(live, persisted):
+    if not persisted:
+        return live
+    if not live:
+        return persisted
+    merged = dict(persisted)
+    for k, v in live.items():
+        if v is not None:
+            merged[k] = v
+    return merged
 
 # 1) Build bulbs.json (merge seed with autodiscovery by
 # --- helpers --------------------------------------------------------------
@@ -137,8 +225,72 @@ def build_config():
 
 
 CONFIG = build_config()
+PERSISTED = load_json(STATE_FILE, {})
 GROUPS = load_json(GROUPS_FILE, {})   # e.g. {"kitchen":["kitchen_1","kitchen_2"], "tv":["tv_left","tv_right"]}
 SCENES = load_json(SCENES_FILE, {})   # e.g. {"movie":[{"target":"tv","cmd":"set_bright","args":[20]}, {"target":"tv","cmd":"set_ct_abx","args":[2700,"smooth",500]}]}
+
+DEFAULT_PRESENCE = {
+    "enabled": False,
+    "device_name": "",
+    "start_time": "19:00",
+    "end_time": "06:00",
+    "target": "all",
+    "routine": "boost",
+    "poll_interval_sec": 30,
+    "cooldown_sec": 0,
+}
+
+def _ensure_presence_defaults(cfg):
+    merged = dict(DEFAULT_PRESENCE)
+    if isinstance(cfg, dict):
+        for k in merged:
+            if k in cfg:
+                merged[k] = cfg[k]
+    return merged
+
+PRESENCE_CONFIG = _ensure_presence_defaults(load_json(PRESENCE_FILE, {}))
+PRESENCE_STATUS = {"present": False, "last_seen": 0, "last_trigger": 0, "last_error": ""}
+
+DEFAULT_ROUTINES = {
+    "sleep": {
+        "target": "all",
+        "duration_min": 30,
+        "start_bright": 80,
+        "end_bright": 10,
+        "start_ct": 3500,
+        "end_ct": 2200,
+    },
+    "wake": {
+        "target": "all",
+        "duration_min": 30,
+        "start_bright": 10,
+        "end_bright": 100,
+        "start_ct": 2200,
+        "end_ct": 5000,
+    },
+    "boost": {
+        "target": "all",
+        "duration_min": 2,
+        "start_bright": 20,
+        "end_bright": 100,
+        "start_ct": 2700,
+        "end_ct": 6000,
+    },
+}
+
+def _ensure_routines_defaults(cfg):
+    merged = json.loads(json.dumps(DEFAULT_ROUTINES))
+    if isinstance(cfg, dict):
+        for name, base in merged.items():
+            incoming = cfg.get(name)
+            if isinstance(incoming, dict):
+                for key in base:
+                    if key in incoming:
+                        base[key] = incoming[key]
+    return merged
+
+ROUTINES_CONFIG = _ensure_routines_defaults(load_json(ROUTINES_FILE, {}))
+ROUTINES_STATUS = {"running": {}, "last_run": {}}
 
 # Bulb cache with music-mode sockets
 class BulbPool:
@@ -163,6 +315,195 @@ class BulbPool:
 
 BULBS = BulbPool()
 
+def save_state():
+    with STATE_LOCK:
+        save_json(STATE_FILE, PERSISTED)
+
+def update_persisted(name, patch):
+    if not name or not isinstance(patch, dict):
+        return
+    with STATE_LOCK:
+        current = PERSISTED.get(name)
+        if not isinstance(current, dict):
+            current = {}
+        if "rgb" in patch:
+            patch["rgb"] = _normalize_rgb(patch.get("rgb"))
+        changed = False
+        for k, v in patch.items():
+            if v is None:
+                continue
+            if current.get(k) != v:
+                current[k] = v
+                changed = True
+        if changed:
+            PERSISTED[name] = current
+            save_json(STATE_FILE, PERSISTED)
+
+def get_persisted(name):
+    with STATE_LOCK:
+        ent = PERSISTED.get(name)
+        return dict(ent) if isinstance(ent, dict) else None
+
+def device_present(name):
+    if not name:
+        return False
+    name = str(name).strip()
+    if not name:
+        return False
+    name_lower = name.lower()
+
+    resolved_ip = None
+    for host in (name, f"{name}.local"):
+        try:
+            resolved_ip = socket.gethostbyname(host)
+            break
+        except Exception:
+            continue
+
+    if resolved_ip:
+        state = _neigh_state(resolved_ip)
+        if state in ("REACHABLE", "DELAY", "PROBE"):
+            return True
+        if state in ("STALE", "FAILED", "INCOMPLETE", ""):
+            _ping_ip(resolved_ip)
+            state = _neigh_state(resolved_ip)
+            return state in ("REACHABLE", "DELAY", "PROBE")
+
+    neigh = _cmd_output(["ip", "neigh", "show"])
+    if neigh and name_lower in neigh.lower():
+        return True
+
+    arp = _cmd_output(["arp", "-a"])
+    if arp and name_lower in arp.lower():
+        return True
+
+    return False
+
+def _presence_targets(target):
+    if not target or target == "all":
+        return list(CONFIG.keys())
+    return names_or_group(target)
+
+def _routine_targets(target):
+    if not target or target == "all":
+        return list(CONFIG.keys())
+    return names_or_group(target)
+
+def _routine_worker(name, cfg):
+    try:
+        ROUTINES_STATUS["running"][name] = True
+        targets = _routine_targets(cfg.get("target"))
+        if not targets:
+            return
+        duration_min = _to_int(cfg.get("duration_min")) or 30
+        duration_sec = max(60, duration_min * 60)
+        steps = max(1, int(duration_sec))
+        interval = 1
+
+        start_bright = clamp(_to_int(cfg.get("start_bright")) or 1, 1, 100)
+        end_bright = clamp(_to_int(cfg.get("end_bright")) or 1, 1, 100)
+        start_ct = clamp(_to_int(cfg.get("start_ct")) or 1700, 1700, 6500)
+        end_ct = clamp(_to_int(cfg.get("end_ct")) or 1700, 1700, 6500)
+
+        for i in range(steps):
+            t = i / (steps - 1) if steps > 1 else 1
+            bright = int(round(start_bright + (end_bright - start_bright) * t))
+            ct = int(round(start_ct + (end_ct - start_ct) * t))
+            for n in targets:
+                b = BULBS.get(n)
+                if not b:
+                    continue
+                try:
+                    b.turn_on()
+                    b.set_brightness(bright)
+                    b.set_color_temp(ct)
+                    update_persisted(n, {"power": "on", "bright": bright, "ct": ct, "color_mode": 2})
+                except Exception as e:
+                    print(f"[warn] routine error for {name}:{n} {e}")
+            time.sleep(interval)
+    finally:
+        ROUTINES_STATUS["running"][name] = False
+        ROUTINES_STATUS["last_run"][name] = time.time()
+
+def start_routine(name, override=None):
+    with ROUTINES_LOCK:
+        cfg = ROUTINES_CONFIG.get(name)
+        if not isinstance(cfg, dict):
+            return False
+        if ROUTINES_STATUS.get("running", {}).get(name):
+            return False
+        cfg_copy = dict(cfg)
+    if isinstance(override, dict):
+        for key, value in override.items():
+            if value is not None:
+                cfg_copy[key] = value
+    threading.Thread(target=_routine_worker, args=(name, cfg_copy), daemon=True).start()
+    return True
+
+def _presence_trigger(cfg):
+    targets = _presence_targets(cfg.get("target"))
+    if not targets:
+        return False
+    routine_name = cfg.get("routine") or "boost"
+    if routine_name and routine_name in ROUTINES_CONFIG:
+        running = bool(ROUTINES_STATUS.get("running", {}).get(routine_name))
+        if running:
+            return True
+        if start_routine(routine_name, {"target": cfg.get("target")}):
+            return True
+    for n in targets:
+        b = BULBS.get(n)
+        if not b:
+            continue
+        try:
+            b.turn_on()
+            update_persisted(n, {"power": "on"})
+        except Exception as e:
+            print(f"[warn] presence power error for {n}: {e}")
+    return True
+
+def _presence_loop():
+    while True:
+        with PRESENCE_LOCK:
+            cfg = dict(PRESENCE_CONFIG)
+        poll = _to_int(cfg.get("poll_interval_sec")) or DEFAULT_PRESENCE["poll_interval_sec"]
+
+        if cfg.get("enabled"):
+            now = datetime.now()
+            now_minutes = now.hour * 60 + now.minute
+            start_minutes = _parse_time_hhmm(cfg.get("start_time"))
+            end_minutes = _parse_time_hhmm(cfg.get("end_time"))
+            if start_minutes is None or end_minutes is None:
+                PRESENCE_STATUS["present"] = False
+                PRESENCE_STATUS["last_error"] = "invalid_time_window"
+                time.sleep(poll)
+                continue
+            if not _time_in_window(now_minutes, start_minutes, end_minutes):
+                PRESENCE_STATUS["present"] = False
+                PRESENCE_STATUS["last_error"] = ""
+                time.sleep(poll)
+                continue
+
+            if not cfg.get("device_name"):
+                PRESENCE_STATUS["present"] = False
+                PRESENCE_STATUS["last_error"] = "device_name_missing"
+                time.sleep(poll)
+                continue
+
+            present = device_present(cfg.get("device_name"))
+            was_present = bool(PRESENCE_STATUS.get("present"))
+            PRESENCE_STATUS["present"] = present
+            if present:
+                PRESENCE_STATUS["last_seen"] = time.time()
+                if not was_present:
+                    triggered = _presence_trigger(cfg)
+                    if triggered:
+                        PRESENCE_STATUS["last_trigger"] = time.time()
+                        PRESENCE_STATUS["last_error"] = ""
+            else:
+                PRESENCE_STATUS["last_error"] = ""
+        time.sleep(poll)
+
 def names_or_group(target):
     # return a list of bulb names (expand groups)
     if target in CONFIG:
@@ -177,22 +518,30 @@ def read_state_for(name):
     """Return live Yeelight properties for a bulb name from CONFIG via BulbPool."""
     b = BULBS.get(name)
     if not b:
-        return None
+        return get_persisted(name)
     try:
         props = b.get_properties(["power", "bright", "ct", "rgb", "hue", "sat", "color_mode"])
-        # yeelight returns strings; keep them as-is so the frontend can compare 'on'/'off'
-        return {
+        color_mode = _to_int(props.get("color_mode"))
+        ct = _to_int(props.get("ct"))
+        rgb = _normalize_rgb(props.get("rgb"))
+        if color_mode == 2:
+            rgb = None
+        elif color_mode in (1, 3):
+            ct = None
+        live = {
             "power": props.get("power"),
-            "bright": props.get("bright"),
-            "ct": props.get("ct"),
-            "rgb": props.get("rgb"),
-            "hue": props.get("hue"),
-            "sat": props.get("sat"),
-            "color_mode": props.get("color_mode"),
+            "bright": _to_int(props.get("bright")),
+            "ct": ct,
+            "rgb": rgb,
+            "hue": _to_int(props.get("hue")),
+            "sat": _to_int(props.get("sat")),
+            "color_mode": color_mode,
         }
+        update_persisted(name, live)
+        return _merge_state(live, get_persisted(name))
     except Exception as e:
         print(f"[warn] read_state error for {name}: {e}")
-        return None
+        return get_persisted(name)
 
 
 @app.route("/api/bulbs", methods=["GET"])
@@ -230,7 +579,9 @@ def power(target, state):
     for n in names:
         b = BULBS.get(n)
         if not b: continue
-        b.turn_on() if state == "on" else b.turn_off()
+        is_on = (state == "on")
+        b.turn_on() if is_on else b.turn_off()
+        update_persisted(n, {"power": "on" if is_on else "off"})
     return jsonify({"ok": True})
 
 @app.route("/api/bright/<target>", methods=["POST"])
@@ -242,6 +593,7 @@ def bright(target):
         b = BULBS.get(n)
         if not b: continue
         b.set_brightness(val)
+        update_persisted(n, {"bright": val})
     return jsonify({"ok": True})
 
 @app.route("/api/ct/<target>", methods=["POST"])
@@ -253,6 +605,7 @@ def ct(target):
         b = BULBS.get(n)
         if not b: continue
         b.set_color_temp(k)
+        update_persisted(n, {"ct": k, "color_mode": 2})
     return jsonify({"ok": True})
 
 @app.route("/api/rgb/<target>", methods=["POST"])
@@ -266,6 +619,7 @@ def rgb(target):
         b = BULBS.get(n)
         if not b: continue
         b.set_rgb(r, g, bl)
+        update_persisted(n, {"rgb": [r, g, bl], "color_mode": 1})
     return jsonify({"ok": True})
 
 @app.route("/api/toggle/<target>", methods=["POST"])
@@ -276,6 +630,9 @@ def toggle(target):
         b = BULBS.get(n)
         if not b: continue
         b.toggle()
+        prev = get_persisted(n)
+        if prev and prev.get("power") in ("on", "off"):
+            update_persisted(n, {"power": "off" if prev.get("power") == "on" else "on"})
     return jsonify({"ok": True})
 
 # Quick animation demo using Flow (works on color bulbs)
@@ -342,6 +699,65 @@ def state_target(target):
     return jsonify({"error": "unknown target"}), 404
 
 
+@app.route("/api/presence", methods=["GET"])
+def presence_get():
+    with PRESENCE_LOCK:
+        cfg = dict(PRESENCE_CONFIG)
+    status = dict(PRESENCE_STATUS)
+    return jsonify({"config": cfg, "status": status})
+
+@app.route("/api/presence", methods=["POST"])
+def presence_set():
+    payload = request.get_json(silent=True) or {}
+    allowed = {"enabled", "device_name", "start_time", "end_time", "target", "routine", "poll_interval_sec", "cooldown_sec"}
+    with PRESENCE_LOCK:
+        for key in allowed:
+            if key in payload:
+                PRESENCE_CONFIG[key] = payload[key]
+        # normalize defaults for any missing keys
+        merged = _ensure_presence_defaults(PRESENCE_CONFIG)
+        PRESENCE_CONFIG.clear()
+        PRESENCE_CONFIG.update(merged)
+        save_json(PRESENCE_FILE, PRESENCE_CONFIG)
+    return jsonify({"ok": True, "config": dict(PRESENCE_CONFIG)})
+
+
+@app.route("/api/routines", methods=["GET"])
+def routines_get():
+    with ROUTINES_LOCK:
+        cfg = json.loads(json.dumps(ROUTINES_CONFIG))
+    status = json.loads(json.dumps(ROUTINES_STATUS))
+    return jsonify({"config": cfg, "status": status})
+
+@app.route("/api/routines", methods=["POST"])
+def routines_set():
+    payload = request.get_json(silent=True) or {}
+    with ROUTINES_LOCK:
+        for name, base in DEFAULT_ROUTINES.items():
+            incoming = payload.get(name)
+            if not isinstance(incoming, dict):
+                continue
+            current = ROUTINES_CONFIG.get(name, {})
+            for key in base:
+                if key in incoming:
+                    current[key] = incoming[key]
+            ROUTINES_CONFIG[name] = current
+        ROUTINES_CONFIG.update(_ensure_routines_defaults(ROUTINES_CONFIG))
+        save_json(ROUTINES_FILE, ROUTINES_CONFIG)
+    return jsonify({"ok": True, "config": json.loads(json.dumps(ROUTINES_CONFIG))})
+
+@app.route("/api/routine/<name>/start", methods=["POST"])
+def routine_start(name):
+    target = request.args.get("target")
+    override = {"target": target} if target else None
+    ok = start_routine(name, override)
+    if not ok:
+        return jsonify({"error": "unable to start"}), 400
+    return jsonify({"ok": True})
+
+
+_presence_thread = threading.Thread(target=_presence_loop, daemon=True)
+_presence_thread.start()
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5006)
-

@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "device_name": "192.168.0.102",
+  "start_time": "19:00",
+  "end_time": "06:00",
+  "target": "KitchenPlafon",
+  "routine": "boost",
+  "poll_interval_sec": 30,
+  "cooldown_sec": 0
+}

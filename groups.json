@@ -1,6 +1,6 @@
 {
-  "tv": ["y1","y2"],
-  "kitchen": ["kitchen_1","kitchen_2"],
-  "bed": ["bed_left","bed_right"]
+  "Plafon": ["Plafon1","Plafon2","Plafon3","Plafon4","Plafon5"],
+  "Kitchen": ["Kitchen1","Kitchen2","Kitchen3","Kitchen4"],
+  "Bed": ["Bed1","Bed2","Bed3"],
+  "KitchenPlafon": ["Kitchen1","Kitchen2","Kitchen3","Kitchen4","Plafon1","Plafon2","Plafon3","Plafon4","Plafon5"]
 }
-
