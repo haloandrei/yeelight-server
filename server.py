@@ -290,7 +290,8 @@ def _ensure_routines_defaults(cfg):
     return merged
 
 ROUTINES_CONFIG = _ensure_routines_defaults(load_json(ROUTINES_FILE, {}))
-ROUTINES_STATUS = {"running": {}, "last_run": {}}
+ROUTINES_STATUS = {"running": {}, "last_run": {}, "running_targets": {}}
+ROUTINES_CANCEL = {}
 
 # Bulb cache with music-mode sockets
 class BulbPool:
@@ -389,12 +390,13 @@ def _routine_targets(target):
         return list(CONFIG.keys())
     return names_or_group(target)
 
-def _routine_worker(name, cfg):
+def _routine_worker(name, cfg, cancel_event):
     try:
         ROUTINES_STATUS["running"][name] = True
         targets = _routine_targets(cfg.get("target"))
         if not targets:
             return
+        ROUTINES_STATUS["running_targets"][name] = targets
         duration_min = _to_int(cfg.get("duration_min")) or 30
         duration_sec = max(60, duration_min * 60)
         steps = max(1, int(duration_sec))
@@ -406,6 +408,8 @@ def _routine_worker(name, cfg):
         end_ct = clamp(_to_int(cfg.get("end_ct")) or 1700, 1700, 6500)
 
         for i in range(steps):
+            if cancel_event.is_set():
+                break
             t = i / (steps - 1) if steps > 1 else 1
             bright = int(round(start_bright + (end_bright - start_bright) * t))
             ct = int(round(start_ct + (end_ct - start_ct) * t))
@@ -414,6 +418,8 @@ def _routine_worker(name, cfg):
                 if not b:
                     continue
                 try:
+                    if cancel_event.is_set():
+                        break
                     b.turn_on()
                     b.set_brightness(bright)
                     b.set_color_temp(ct)
@@ -423,6 +429,7 @@ def _routine_worker(name, cfg):
             time.sleep(interval)
     finally:
         ROUTINES_STATUS["running"][name] = False
+        ROUTINES_STATUS["running_targets"][name] = []
         ROUTINES_STATUS["last_run"][name] = time.time()
 
 def start_routine(name, override=None):
@@ -430,15 +437,39 @@ def start_routine(name, override=None):
         cfg = ROUTINES_CONFIG.get(name)
         if not isinstance(cfg, dict):
             return False
-        if ROUTINES_STATUS.get("running", {}).get(name):
+        running = ROUTINES_STATUS.get("running", {})
+        if any(running.values()):
+            return False
+        if running.get(name):
             return False
         cfg_copy = dict(cfg)
     if isinstance(override, dict):
         for key, value in override.items():
             if value is not None:
                 cfg_copy[key] = value
-    threading.Thread(target=_routine_worker, args=(name, cfg_copy), daemon=True).start()
+    cancel_event = threading.Event()
+    ROUTINES_CANCEL[name] = cancel_event
+    threading.Thread(target=_routine_worker, args=(name, cfg_copy, cancel_event), daemon=True).start()
     return True
+
+def stop_routine(name):
+    cancel = ROUTINES_CANCEL.get(name)
+    if cancel:
+        cancel.set()
+        return True
+    return False
+
+def stop_routines_for_targets(targets):
+    if not targets:
+        return
+    running_targets = ROUTINES_STATUS.get("running_targets", {})
+    for routine_name, routine_targets in running_targets.items():
+        if not ROUTINES_STATUS.get("running", {}).get(routine_name):
+            continue
+        if not routine_targets:
+            continue
+        if any(t in routine_targets for t in targets):
+            stop_routine(routine_name)
 
 def _presence_trigger(cfg):
     targets = _presence_targets(cfg.get("target"))
@@ -576,12 +607,14 @@ def run_scene(scene):
 def power(target, state):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
+    is_on = (state == "on")
     for n in names:
         b = BULBS.get(n)
         if not b: continue
-        is_on = (state == "on")
         b.turn_on() if is_on else b.turn_off()
         update_persisted(n, {"power": "on" if is_on else "off"})
+    if not is_on:
+        stop_routines_for_targets(names)
     return jsonify({"ok": True})
 
 @app.route("/api/bright/<target>", methods=["POST"])
@@ -753,6 +786,13 @@ def routine_start(name):
     ok = start_routine(name, override)
     if not ok:
         return jsonify({"error": "unable to start"}), 400
+    return jsonify({"ok": True})
+
+@app.route("/api/routine/<name>/stop", methods=["POST"])
+def routine_stop(name):
+    ok = stop_routine(name)
+    if not ok:
+        return jsonify({"error": "unable to stop"}), 400
     return jsonify({"ok": True})
 
 

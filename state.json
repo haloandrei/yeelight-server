@@ -1,48 +1,48 @@
 {
   "Plafon1": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 0,
     "sat": 100,
     "color_mode": 2
   },
   "Kitchen4": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 12,
     "sat": 100,
     "color_mode": 2
   },
   "Kitchen3": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 12,
     "sat": 100,
     "color_mode": 2
   },
   "Kitchen2": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 12,
     "sat": 100,
     "color_mode": 2
   },
   "Kitchen1": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 12,
     "sat": 100,
     "color_mode": 2
   },
   "Plafon2": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 216,
     "sat": 4,
     "color_mode": 2,
@@ -55,41 +55,41 @@
   "Bed1": {
     "power": "off",
     "bright": 100,
-    "ct": 6000,
-    "hue": 6,
-    "sat": 100,
+    "ct": 2700,
+    "hue": 25,
+    "sat": 91,
     "color_mode": 2,
     "rgb": [
-      255,
-      70,
-      0
+      249,
+      115,
+      22
     ]
   },
   "Bed2": {
     "power": "off",
     "bright": 100,
-    "ct": 6000,
-    "hue": 6,
-    "sat": 100,
+    "ct": 2700,
+    "hue": 25,
+    "sat": 91,
     "color_mode": 2,
     "rgb": [
-      255,
-      70,
-      0
+      249,
+      115,
+      22
     ]
   },
   "Plafon4": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 0,
     "sat": 100,
     "color_mode": 2
   },
   "Plafon5": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 0,
     "sat": 100,
     "color_mode": 2
@@ -97,20 +97,20 @@
   "Bed3": {
     "power": "off",
     "bright": 100,
-    "ct": 6000,
-    "hue": 6,
-    "sat": 100,
+    "ct": 2700,
+    "hue": 25,
+    "sat": 91,
     "color_mode": 2,
     "rgb": [
-      255,
-      70,
-      0
+      249,
+      115,
+      22
     ]
   },
   "Plafon3": {
     "power": "on",
-    "bright": 100,
-    "ct": 6000,
+    "bright": 48,
+    "ct": 3837,
     "hue": 0,
     "sat": 100,
     "color_mode": 2
