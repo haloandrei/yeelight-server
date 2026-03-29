@@ -11,6 +11,7 @@ SCENES_FILE = "scenes.json"      # optional scenes
 STATE_FILE = "state.json"        # persisted bulb state (name -> {power,bright,ct,rgb,...})
 PRESENCE_FILE = "presence.json"  # presence automation config
 ROUTINES_FILE = "routines.json"  # routine configs
+MUSIC_FILE = "music.json"        # per-bulb desired music mode (name -> bool)
 
 app = Flask(__name__)
 
@@ -31,6 +32,7 @@ STATE_CACHE_LOCK = threading.Lock()
 STATE_REFRESH_LOCK = threading.Lock()
 BULB_LOCKS_LOCK = threading.Lock()
 COMMAND_BACKOFF_LOCK = threading.Lock()
+MUSIC_LOCK = threading.Lock()
 
 def _env_int(name, fallback):
     raw = os.getenv(name)
@@ -343,6 +345,50 @@ ROUTINES_CONFIG = _ensure_routines_defaults(load_json(ROUTINES_FILE, {}))
 ROUTINES_STATUS = {"running": {}, "last_run": {}, "running_targets": {}}
 ROUTINES_CANCEL = {}
 
+def _normalize_music_config(cfg):
+    current = {}
+    if isinstance(cfg, dict):
+        for k, v in cfg.items():
+            current[str(k)] = bool(v)
+    normalized = {}
+    for name in CONFIG.keys():
+        normalized[name] = bool(current.get(name, USE_MUSIC_MODE))
+    return normalized
+
+MUSIC_CONFIG = _normalize_music_config(load_json(MUSIC_FILE, {}))
+
+def sync_music_config():
+    with MUSIC_LOCK:
+        normalized = _normalize_music_config(MUSIC_CONFIG)
+        changed = normalized != MUSIC_CONFIG
+        if changed:
+            MUSIC_CONFIG.clear()
+            MUSIC_CONFIG.update(normalized)
+            save_json(MUSIC_FILE, MUSIC_CONFIG)
+        return dict(MUSIC_CONFIG)
+
+def save_music_config():
+    with MUSIC_LOCK:
+        save_json(MUSIC_FILE, MUSIC_CONFIG)
+
+def music_snapshot():
+    with MUSIC_LOCK:
+        return dict(MUSIC_CONFIG)
+
+def is_music_enabled(name):
+    with MUSIC_LOCK:
+        return bool(MUSIC_CONFIG.get(name, USE_MUSIC_MODE))
+
+def set_music_enabled(name, enabled, persist=True):
+    if not name:
+        return
+    with MUSIC_LOCK:
+        MUSIC_CONFIG[name] = bool(enabled)
+        if persist:
+            save_json(MUSIC_FILE, MUSIC_CONFIG)
+
+sync_music_config()
+
 # Bulb cache with music-mode sockets
 class BulbPool:
     def __init__(self):
@@ -356,14 +402,29 @@ class BulbPool:
         b = self._pool.get(name)
         if b is None:
             b = Bulb(ip, auto_on=False, effect="smooth", duration=300)
-            # Music mode is optional; default off for stability on bulbs that enforce strict client quotas.
-            if USE_MUSIC_MODE:
-                try:
-                    b.start_music()
-                except Exception:
-                    pass
             self._pool[name] = b
+        self._sync_music_mode(name, b)
         return b
+
+    def _sync_music_mode(self, name, bulb):
+        if bulb is None:
+            return True
+        desired = is_music_enabled(name)
+        try:
+            if desired:
+                bulb.start_music()
+            else:
+                bulb.stop_music()
+            return True
+        except Exception:
+            return False
+
+    def set_music(self, name, enabled):
+        set_music_enabled(name, enabled, persist=False)
+        bulb = self._pool.get(name)
+        if bulb is None:
+            return True
+        return self._sync_music_mode(name, bulb)
 
     def clear(self):
         for bulb in self._pool.values():
@@ -946,6 +1007,36 @@ def list_bulbs():
 def list_groups():
     return jsonify(GROUPS)
 
+@app.route("/api/music", methods=["GET"])
+def music_get():
+    return jsonify({"enabled": sync_music_config(), "default": USE_MUSIC_MODE})
+
+@app.route("/api/music/<target>/<state>", methods=["POST"])
+def music_set(target, state):
+    names = names_or_group(target)
+    if not names:
+        return jsonify({"error": "unknown target"}), 404
+    state = (state or "").strip().lower()
+    if state not in ("on", "off"):
+        return jsonify({"error": "invalid_state"}), 400
+    enabled = (state == "on")
+    errors = []
+    applied = []
+    for name in names:
+        ok = BULBS.set_music(name, enabled)
+        if ok:
+            applied.append(name)
+        else:
+            errors.append({"target": name, "error": "music_apply_failed"})
+    save_music_config()
+    return jsonify({
+        "ok": len(errors) == 0,
+        "applied": len(applied),
+        "failed": len(errors),
+        "errors": errors,
+        "enabled": sync_music_config(),
+    })
+
 @app.route("/api/scene/<scene>", methods=["POST"])
 def run_scene(scene):
     steps = SCENES.get(scene)
@@ -1181,6 +1272,7 @@ def api_scan():
     global CONFIG
     new_cfg = build_config()
     CONFIG = new_cfg
+    sync_music_config()
     BULBS.clear()
     invalidate_state_cache()
     return jsonify({"ok": True, "count": len(new_cfg), "names": list(new_cfg.keys())})
