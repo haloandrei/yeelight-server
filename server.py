@@ -1,4 +1,5 @@
 import json, os, threading, time, subprocess, socket
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Flask, request, jsonify
 from yeelight import Bulb, discover_bulbs, Flow, transitions
@@ -26,6 +27,36 @@ def save_json(path, data):
 STATE_LOCK = threading.Lock()
 PRESENCE_LOCK = threading.Lock()
 ROUTINES_LOCK = threading.Lock()
+STATE_CACHE_LOCK = threading.Lock()
+STATE_REFRESH_LOCK = threading.Lock()
+BULB_LOCKS_LOCK = threading.Lock()
+COMMAND_BACKOFF_LOCK = threading.Lock()
+
+def _env_int(name, fallback):
+    raw = os.getenv(name)
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+ACTION_WORKERS = max(2, _env_int("ACTION_WORKERS", 8))
+STATE_CACHE_MS = max(0, _env_int("STATE_CACHE_MS", 1200))
+USE_MUSIC_MODE = os.getenv("YEE_USE_MUSIC_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+COMMAND_TIMEOUT_SEC = max(0.2, _env_int("COMMAND_TIMEOUT_MS", 2500) / 1000.0)
+COMMAND_LOCK_TIMEOUT_SEC = max(0.05, _env_int("COMMAND_LOCK_TIMEOUT_MS", 250) / 1000.0)
+COMMAND_QUOTA_BACKOFF_SEC = max(0.2, _env_int("COMMAND_QUOTA_BACKOFF_MS", 1500) / 1000.0)
+DISCOVERY_TIMEOUT_SEC = max(1, _env_int("DISCOVERY_TIMEOUT_SEC", 2))
+COMMAND_PORT = max(1, _env_int("YEE_PORT", 55443))
+CONTROL_RETRY_DELAY_SEC = max(0.05, _env_int("CONTROL_RETRY_DELAY_MS", 320) / 1000.0)
+POWER_BURST_GAP_SEC = max(0.01, _env_int("POWER_BURST_GAP_MS", 180) / 1000.0)
+COLOR_WAKE_DELAY_SEC = max(0.02, _env_int("COLOR_WAKE_DELAY_MS", 180) / 1000.0)
+
+STATE_CACHE = {"at": 0.0, "data": {}}
+BULB_LOCKS = {}
+COMMAND_BACKOFF_UNTIL = {}
+APPLY_EXECUTOR = ThreadPoolExecutor(max_workers=ACTION_WORKERS)
 
 def _cmd_output(cmd):
     try:
@@ -34,21 +65,30 @@ def _cmd_output(cmd):
     except Exception:
         return ""
 
-def _neigh_state(ip):
-    out = _cmd_output(["ip", "neigh", "show", ip]).strip()
+def _neigh_entry(ip, iface=None):
+    cmd = ["ip", "neigh", "show", ip]
+    if iface:
+        cmd += ["dev", iface]
+    out = _cmd_output(cmd).strip()
     if not out:
-        return ""
-    parts = out.split()
-    return parts[-1] if parts else ""
+        return None
+    line = out.splitlines()[0]
+    parts = line.split()
+    lladdr = None
+    if "lladdr" in parts:
+        idx = parts.index("lladdr")
+        if idx + 1 < len(parts):
+            lladdr = parts[idx + 1]
+    state = parts[-1] if parts else ""
+    return {"state": state, "lladdr": lladdr, "line": line}
 
-def _ping_ip(ip):
+def _ping_ip(ip, iface=None):
     try:
-        res = subprocess.run(
-            ["ping", "-c", "1", "-W", "1", ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        cmd = ["ping", "-c", "1", "-W", "1"]
+        if iface:
+            cmd += ["-I", iface]
+        cmd.append(ip)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return res.returncode == 0
     except Exception:
         return False
@@ -145,9 +185,9 @@ def build_config():
     merged = dict(cfg)
     for name, ent in seed.items():
         me = merged.get(name, {})
-        # Seed wins for friendly name; keep id/ip if present
-        if ent.get("id"): me["id"] = ent["id"]
-        if ent.get("ip"): me["ip"] = ent["ip"]
+        # Seed only bootstraps missing fields; discovery/runtime stays authoritative.
+        if ent.get("id") and not me.get("id"): me["id"] = ent["id"]
+        if ent.get("ip") and not me.get("ip"): me["ip"] = ent["ip"]
         merged[name] = me
 
     # Build indices before discovery
@@ -232,6 +272,8 @@ SCENES = load_json(SCENES_FILE, {})   # e.g. {"movie":[{"target":"tv","cmd":"set
 DEFAULT_PRESENCE = {
     "enabled": False,
     "device_name": "",
+    "device_mac": "",
+    "device_iface": "",
     "start_time": "19:00",
     "end_time": "06:00",
     "target": "all",
@@ -249,7 +291,15 @@ def _ensure_presence_defaults(cfg):
     return merged
 
 PRESENCE_CONFIG = _ensure_presence_defaults(load_json(PRESENCE_FILE, {}))
-PRESENCE_STATUS = {"present": False, "last_seen": 0, "last_trigger": 0, "last_error": ""}
+PRESENCE_STATUS = {
+    "present": False,
+    "last_seen": 0,
+    "last_trigger": 0,
+    "last_error": "",
+    "window_active": False,
+    "seen_absent": False,
+    "absent_since": 0,
+}
 
 DEFAULT_ROUTINES = {
     "sleep": {
@@ -306,13 +356,31 @@ class BulbPool:
         b = self._pool.get(name)
         if b is None:
             b = Bulb(ip, auto_on=False, effect="smooth", duration=300)
-            # try music mode (faster): opens persistent socket
-            try:
-                b.start_music()
-            except Exception:
-                pass
+            # Music mode is optional; default off for stability on bulbs that enforce strict client quotas.
+            if USE_MUSIC_MODE:
+                try:
+                    b.start_music()
+                except Exception:
+                    pass
             self._pool[name] = b
         return b
+
+    def clear(self):
+        for bulb in self._pool.values():
+            try:
+                bulb.stop_music()
+            except Exception:
+                pass
+        self._pool = {}
+
+    def evict(self, name):
+        bulb = self._pool.pop(name, None)
+        if not bulb:
+            return
+        try:
+            bulb.stop_music()
+        except Exception:
+            pass
 
 BULBS = BulbPool()
 
@@ -345,7 +413,7 @@ def get_persisted(name):
         ent = PERSISTED.get(name)
         return dict(ent) if isinstance(ent, dict) else None
 
-def device_present(name):
+def device_present(name, device_mac=None, device_iface=None):
     if not name:
         return False
     name = str(name).strip()
@@ -362,13 +430,22 @@ def device_present(name):
             continue
 
     if resolved_ip:
-        state = _neigh_state(resolved_ip)
-        if state in ("REACHABLE", "DELAY", "PROBE"):
-            return True
-        if state in ("STALE", "FAILED", "INCOMPLETE", ""):
-            _ping_ip(resolved_ip)
-            state = _neigh_state(resolved_ip)
-            return state in ("REACHABLE", "DELAY", "PROBE")
+        entry = _neigh_entry(resolved_ip, device_iface)
+        if entry:
+            if device_mac and entry.get("lladdr") and entry["lladdr"].lower() != device_mac.lower():
+                return False
+            if entry["state"] in ("REACHABLE", "DELAY", "PROBE"):
+                return True
+        _ping_ip(resolved_ip, device_iface)
+        entry = _neigh_entry(resolved_ip, device_iface)
+        if entry:
+            if device_mac and entry.get("lladdr") and entry["lladdr"].lower() != device_mac.lower():
+                return False
+            return entry["state"] in ("REACHABLE", "DELAY", "PROBE")
+        return False
+
+    if device_mac or device_iface:
+        return False
 
     neigh = _cmd_output(["ip", "neigh", "show"])
     if neigh and name_lower in neigh.lower():
@@ -384,6 +461,281 @@ def _presence_targets(target):
     if not target or target == "all":
         return list(CONFIG.keys())
     return names_or_group(target)
+
+def _bulb_lock(name):
+    with BULB_LOCKS_LOCK:
+        lock = BULB_LOCKS.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            BULB_LOCKS[name] = lock
+        return lock
+
+def invalidate_state_cache():
+    with STATE_CACHE_LOCK:
+        STATE_CACHE["at"] = 0.0
+        STATE_CACHE["data"] = {}
+
+def _quota_backoff_remaining(name):
+    now = time.time()
+    with COMMAND_BACKOFF_LOCK:
+        until = COMMAND_BACKOFF_UNTIL.get(name, 0.0)
+    if until <= now:
+        return 0.0
+    return until - now
+
+def _set_quota_backoff(name):
+    with COMMAND_BACKOFF_LOCK:
+        COMMAND_BACKOFF_UNTIL[name] = time.time() + COMMAND_QUOTA_BACKOFF_SEC
+
+def _discovery_state_from_caps(caps):
+    if not isinstance(caps, dict):
+        return None
+    color_mode = _to_int(caps.get("color_mode"))
+    ct = _to_int(caps.get("ct"))
+    rgb = _normalize_rgb(caps.get("rgb"))
+    if color_mode == 2:
+        rgb = None
+    elif color_mode in (1, 3):
+        ct = None
+    return {
+        "power": caps.get("power"),
+        "bright": _to_int(caps.get("bright")),
+        "ct": ct,
+        "rgb": rgb,
+        "hue": _to_int(caps.get("hue")),
+        "sat": _to_int(caps.get("sat")),
+        "color_mode": color_mode,
+    }
+
+def _refresh_state_snapshot(force=False):
+    now = time.time()
+    cache_ttl = STATE_CACHE_MS / 1000.0
+    if not force and cache_ttl > 0:
+        with STATE_CACHE_LOCK:
+            cached_at = STATE_CACHE.get("at", 0.0)
+            cached_data = STATE_CACHE.get("data")
+            if cached_data and (now - cached_at) <= cache_ttl:
+                return cached_data
+
+    # Keep only one in-flight discovery refresh to prevent fan-out spikes.
+    acquired = STATE_REFRESH_LOCK.acquire(blocking=False)
+    if not acquired:
+        with STATE_CACHE_LOCK:
+            cached_data = STATE_CACHE.get("data") or {}
+            if cached_data:
+                return cached_data
+        fallback = {}
+        for name in CONFIG.keys():
+            st = get_persisted(name)
+            if st:
+                fallback[name] = st
+        return fallback
+
+    try:
+        discovered = discover_bulbs(timeout=DISCOVERY_TIMEOUT_SEC)
+        by_id = {}
+        by_ip = {}
+        for item in discovered:
+            ip = item.get("ip")
+            caps = item.get("capabilities", {})
+            bid = caps.get("id")
+            if bid:
+                by_id[bid] = item
+            if ip:
+                by_ip[ip] = item
+
+        snapshot = {}
+        cfg_changed = False
+        for name, ent in CONFIG.items():
+            match = None
+            bid = ent.get("id")
+            ip = ent.get("ip")
+            if bid and bid in by_id:
+                match = by_id[bid]
+            elif ip and ip in by_ip:
+                match = by_ip[ip]
+
+            live = None
+            if match:
+                caps = match.get("capabilities", {})
+                live = _discovery_state_from_caps(caps)
+                seen_ip = match.get("ip")
+                if seen_ip and ent.get("ip") != seen_ip:
+                    ent["ip"] = seen_ip
+                    CONFIG[name] = ent
+                    cfg_changed = True
+
+            persisted = get_persisted(name) or {}
+            merged = _merge_state(live or {}, persisted)
+            if merged:
+                snapshot[name] = merged
+            elif persisted:
+                snapshot[name] = persisted
+
+        if cfg_changed:
+            save_json(CFG_FILE, CONFIG)
+
+        with STATE_CACHE_LOCK:
+            STATE_CACHE["at"] = time.time()
+            STATE_CACHE["data"] = snapshot
+        return snapshot
+    except Exception as e:
+        print(f"[warn] state discovery refresh failed: {e}")
+        with STATE_CACHE_LOCK:
+            cached_data = STATE_CACHE.get("data") or {}
+            if cached_data:
+                return cached_data
+        fallback = {}
+        for name in CONFIG.keys():
+            st = get_persisted(name)
+            if st:
+                fallback[name] = st
+        return fallback
+    finally:
+        STATE_REFRESH_LOCK.release()
+
+def refresh_bulb_ip(name):
+    ent = CONFIG.get(name)
+    if not ent:
+        return False
+    bid = ent.get("id")
+    if not bid:
+        return False
+    try:
+        for b in discover_bulbs(timeout=DISCOVERY_TIMEOUT_SEC):
+            did = b.get("capabilities", {}).get("id")
+            if did != bid:
+                continue
+            new_ip = b.get("ip")
+            if not new_ip:
+                return False
+            if ent.get("ip") != new_ip:
+                ent["ip"] = new_ip
+                CONFIG[name] = ent
+                save_json(CFG_FILE, CONFIG)
+            BULBS.evict(name)
+            print(f"[net] refreshed {name} ip={new_ip}")
+            return True
+    except Exception as e:
+        print(f"[warn] refresh_bulb_ip error for {name}: {e}")
+    return False
+
+def _send_command_once(name, method, params):
+    ent = CONFIG.get(name)
+    if not ent:
+        return False, "unknown_target"
+
+    backoff = _quota_backoff_remaining(name)
+    if backoff > 0:
+        return False, f"quota_backoff_{backoff:.2f}s"
+
+    lock = _bulb_lock(name)
+    if not lock.acquire(timeout=COMMAND_LOCK_TIMEOUT_SEC):
+        return False, "busy"
+
+    sock = None
+    try:
+        ip = ent.get("ip")
+        if not ip and refresh_bulb_ip(name):
+            ip = CONFIG.get(name, {}).get("ip")
+        if not ip:
+            return False, "ip_missing"
+
+        req = {
+            "id": int(time.time() * 1000) % 1_000_000_000,
+            "method": method,
+            "params": params,
+        }
+        payload = (json.dumps(req, separators=(",", ":")) + "\r\n").encode()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(COMMAND_TIMEOUT_SEC)
+        sock.connect((ip, COMMAND_PORT))
+        sock.sendall(payload)
+
+        try:
+            raw = sock.recv(4096)
+        except socket.timeout:
+            return False, "timeout"
+
+        if not raw:
+            return False, "empty_response"
+
+        line = raw.decode(errors="ignore").strip().splitlines()[0]
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            return False, "invalid_response"
+
+        if isinstance(parsed, dict) and parsed.get("error"):
+            err_obj = parsed.get("error")
+            if isinstance(err_obj, dict):
+                msg = err_obj.get("message") or str(err_obj)
+            else:
+                msg = str(err_obj)
+            msg_text = str(msg)
+            if "client quota exceeded" in msg_text.lower():
+                _set_quota_backoff(name)
+            return False, msg_text
+
+        return True, None
+    except Exception as e:
+        text = str(e)
+        if "timed out" in text.lower():
+            return False, "timeout"
+        return False, text
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        lock.release()
+
+def _run_with_retry(name, action_name, op, retries=1, retry_delay=0.05, refresh_ip=False):
+    attempts = max(1, int(retries))
+    delay = max(0.0, float(retry_delay))
+    last_error = "unknown_error"
+    for attempt in range(1, attempts + 1):
+        ok, err = op(name)
+        if ok:
+            return True, None
+        last_error = str(err or "unknown_error")
+        print(f"[warn] {action_name} error target={name} attempt={attempt}/{attempts}: {last_error}")
+        if attempt < attempts:
+            err_low = last_error.lower()
+            if refresh_ip and ("ip_missing" in err_low or "network" in err_low or "refused" in err_low or "timeout" in err_low):
+                refresh_bulb_ip(name)
+            if delay > 0:
+                time.sleep(delay * attempt)
+    return False, last_error
+
+def _apply_targets(names, action_name, op, retries=1, retry_delay=0.05, refresh_ip=False):
+    success = []
+    errors = []
+
+    def _task(n):
+        return n, _run_with_retry(
+            n,
+            action_name,
+            op,
+            retries=retries,
+            retry_delay=retry_delay,
+            refresh_ip=refresh_ip,
+        )
+
+    future_to_name = {APPLY_EXECUTOR.submit(_task, n): n for n in names}
+    for fut, fallback_name in future_to_name.items():
+        try:
+            n, (ok, err) = fut.result()
+            if ok:
+                success.append(n)
+            else:
+                errors.append({"target": n, "error": err})
+        except Exception as e:
+            n = fallback_name or "unknown"
+            errors.append({"target": n, "error": str(e)})
+    return success, errors
 
 def _routine_targets(target):
     if not target or target == "all":
@@ -439,6 +791,7 @@ def start_routine(name, override=None):
             return False
         running = ROUTINES_STATUS.get("running", {})
         if any(running.values()):
+            print(f"[routine] start blocked: another routine already running (requested={name})")
             return False
         if running.get(name):
             return False
@@ -447,6 +800,7 @@ def start_routine(name, override=None):
         for key, value in override.items():
             if value is not None:
                 cfg_copy[key] = value
+    print(f"[routine] start {name} target={cfg_copy.get('target')} duration_min={cfg_copy.get('duration_min')}")
     cancel_event = threading.Event()
     ROUTINES_CANCEL[name] = cancel_event
     threading.Thread(target=_routine_worker, args=(name, cfg_copy, cancel_event), daemon=True).start()
@@ -455,6 +809,7 @@ def start_routine(name, override=None):
 def stop_routine(name):
     cancel = ROUTINES_CANCEL.get(name)
     if cancel:
+        print(f"[routine] stop {name}")
         cancel.set()
         return True
     return False
@@ -469,6 +824,7 @@ def stop_routines_for_targets(targets):
         if not routine_targets:
             continue
         if any(t in routine_targets for t in targets):
+            print(f"[routine] stop due to power off targets={targets} routine={routine_name}")
             stop_routine(routine_name)
 
 def _presence_trigger(cfg):
@@ -509,11 +865,20 @@ def _presence_loop():
                 PRESENCE_STATUS["last_error"] = "invalid_time_window"
                 time.sleep(poll)
                 continue
-            if not _time_in_window(now_minutes, start_minutes, end_minutes):
+            window_active = _time_in_window(now_minutes, start_minutes, end_minutes)
+            prev_window_active = bool(PRESENCE_STATUS.get("window_active"))
+            if not window_active:
                 PRESENCE_STATUS["present"] = False
                 PRESENCE_STATUS["last_error"] = ""
+                PRESENCE_STATUS["window_active"] = False
+                PRESENCE_STATUS["seen_absent"] = False
+                PRESENCE_STATUS["absent_since"] = 0
                 time.sleep(poll)
                 continue
+            if not prev_window_active:
+                PRESENCE_STATUS["window_active"] = True
+                PRESENCE_STATUS["seen_absent"] = False
+                PRESENCE_STATUS["absent_since"] = 0
 
             if not cfg.get("device_name"):
                 PRESENCE_STATUS["present"] = False
@@ -521,22 +886,43 @@ def _presence_loop():
                 time.sleep(poll)
                 continue
 
-            present = device_present(cfg.get("device_name"))
+            present = device_present(
+                cfg.get("device_name"),
+                cfg.get("device_mac"),
+                cfg.get("device_iface"),
+            )
             was_present = bool(PRESENCE_STATUS.get("present"))
             PRESENCE_STATUS["present"] = present
             if present:
                 PRESENCE_STATUS["last_seen"] = time.time()
                 if not was_present:
-                    triggered = _presence_trigger(cfg)
-                    if triggered:
-                        PRESENCE_STATUS["last_trigger"] = time.time()
-                        PRESENCE_STATUS["last_error"] = ""
+                    if not PRESENCE_STATUS.get("seen_absent"):
+                        print(f"[presence] skip (present at window start) device={cfg.get('device_name')}")
+                    else:
+                        cooldown = max(0, _to_int(cfg.get("cooldown_sec")) or 0)
+                        absent_since = PRESENCE_STATUS.get("absent_since") or 0
+                        absent_for = (time.time() - absent_since) if absent_since else 0
+                        if cooldown > 0 and absent_for < cooldown:
+                            remaining = int(cooldown - absent_for)
+                            print(f"[presence] cooldown active: wait {remaining}s before reconnect trigger")
+                            PRESENCE_STATUS["last_error"] = "cooldown_wait"
+                        else:
+                            print(f"[presence] trigger device={cfg.get('device_name')} target={cfg.get('target')} routine={cfg.get('routine')}")
+                            triggered = _presence_trigger(cfg)
+                            if triggered:
+                                PRESENCE_STATUS["last_trigger"] = time.time()
+                                PRESENCE_STATUS["last_error"] = ""
             else:
                 PRESENCE_STATUS["last_error"] = ""
+                if was_present or not PRESENCE_STATUS.get("seen_absent"):
+                    PRESENCE_STATUS["absent_since"] = time.time()
+                PRESENCE_STATUS["seen_absent"] = True
         time.sleep(poll)
 
 def names_or_group(target):
     # return a list of bulb names (expand groups)
+    if target == "all":
+        return list(CONFIG.keys())
     if target in CONFIG:
         return [target]
     if target in GROUPS:
@@ -545,34 +931,11 @@ def names_or_group(target):
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-def read_state_for(name):
-    """Return live Yeelight properties for a bulb name from CONFIG via BulbPool."""
-    b = BULBS.get(name)
-    if not b:
-        return get_persisted(name)
-    try:
-        props = b.get_properties(["power", "bright", "ct", "rgb", "hue", "sat", "color_mode"])
-        color_mode = _to_int(props.get("color_mode"))
-        ct = _to_int(props.get("ct"))
-        rgb = _normalize_rgb(props.get("rgb"))
-        if color_mode == 2:
-            rgb = None
-        elif color_mode in (1, 3):
-            ct = None
-        live = {
-            "power": props.get("power"),
-            "bright": _to_int(props.get("bright")),
-            "ct": ct,
-            "rgb": rgb,
-            "hue": _to_int(props.get("hue")),
-            "sat": _to_int(props.get("sat")),
-            "color_mode": color_mode,
-        }
-        update_persisted(name, live)
-        return _merge_state(live, get_persisted(name))
-    except Exception as e:
-        print(f"[warn] read_state error for {name}: {e}")
-        return get_persisted(name)
+def read_state_for(name, snapshot=None):
+    source = snapshot if isinstance(snapshot, dict) else _refresh_state_snapshot(force=False)
+    if isinstance(source, dict) and name in source:
+        return source.get(name)
+    return get_persisted(name)
 
 
 @app.route("/api/bulbs", methods=["GET"])
@@ -601,6 +964,7 @@ def run_scene(scene):
                 print("scene step error", name, cmd, e)
         # optional step delay
         time.sleep(step.get("sleep", 0)/1000 if "sleep" in step else 0)
+    invalidate_state_cache()
     return jsonify({"ok": True})
 
 @app.route("/api/power/<target>/<state>", methods=["POST"])
@@ -608,65 +972,188 @@ def power(target, state):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
     is_on = (state == "on")
-    for n in names:
-        b = BULBS.get(n)
-        if not b: continue
-        b.turn_on() if is_on else b.turn_off()
+    burst_raw = _to_int(request.args.get("burst"))
+    retries_raw = _to_int(request.args.get("retries"))
+    burst = clamp(1 if burst_raw is None else burst_raw, 1, 3)
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+
+    def _op(name):
+        for i in range(burst):
+            ok, err = _send_command_once(
+                name,
+                "set_power",
+                ["on" if is_on else "off", "sudden", 0],
+            )
+            if not ok:
+                return False, err
+            if burst > 1 and i < burst - 1:
+                time.sleep(POWER_BURST_GAP_SEC)
+        return True, None
+
+    success, errors = _apply_targets(
+        names,
+        "power",
+        _op,
+        retries=retries,
+        retry_delay=CONTROL_RETRY_DELAY_SEC,
+        refresh_ip=True,
+    )
+    for n in success:
         update_persisted(n, {"power": "on" if is_on else "off"})
+    invalidate_state_cache()
     if not is_on:
         stop_routines_for_targets(names)
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": len(errors) == 0,
+        "applied": len(success),
+        "failed": len(errors),
+        "burst": burst,
+        "retries": retries,
+        "errors": errors,
+    })
 
 @app.route("/api/bright/<target>", methods=["POST"])
 def bright(target):
-    val = clamp(int(request.args.get("level", 50)), 1, 100)
+    val_raw = _to_int(request.args.get("level"))
+    val = clamp(50 if val_raw is None else val_raw, 1, 100)
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
-    for n in names:
-        b = BULBS.get(n)
-        if not b: continue
-        b.set_brightness(val)
+    retries_raw = _to_int(request.args.get("retries"))
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+
+    def _op(name):
+        return _send_command_once(name, "set_bright", [val, "sudden", 0])
+
+    success, errors = _apply_targets(
+        names,
+        "bright",
+        _op,
+        retries=retries,
+        retry_delay=CONTROL_RETRY_DELAY_SEC,
+        refresh_ip=True,
+    )
+    for n in success:
         update_persisted(n, {"bright": val})
-    return jsonify({"ok": True})
+    invalidate_state_cache()
+    return jsonify({"ok": len(errors) == 0, "applied": len(success), "failed": len(errors), "errors": errors})
 
 @app.route("/api/ct/<target>", methods=["POST"])
 def ct(target):
-    k = clamp(int(request.args.get("k", 4000)), 1700, 6500)
+    k_raw = _to_int(request.args.get("k"))
+    k = clamp(4000 if k_raw is None else k_raw, 1700, 6500)
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
-    for n in names:
-        b = BULBS.get(n)
-        if not b: continue
-        b.set_color_temp(k)
+    retries_raw = _to_int(request.args.get("retries"))
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+
+    def _op(name):
+        return _send_command_once(name, "set_ct_abx", [k, "sudden", 0])
+
+    success, errors = _apply_targets(
+        names,
+        "ct",
+        _op,
+        retries=retries,
+        retry_delay=CONTROL_RETRY_DELAY_SEC,
+        refresh_ip=True,
+    )
+    for n in success:
         update_persisted(n, {"ct": k, "color_mode": 2})
-    return jsonify({"ok": True})
+    invalidate_state_cache()
+    return jsonify({"ok": len(errors) == 0, "applied": len(success), "failed": len(errors), "errors": errors})
 
 @app.route("/api/rgb/<target>", methods=["POST"])
 def rgb(target):
-    r = clamp(int(request.args.get("r", 255)), 0, 255)
-    g = clamp(int(request.args.get("g", 255)), 0, 255)
-    bl = clamp(int(request.args.get("b", 255)), 0, 255)
+    r_raw = _to_int(request.args.get("r"))
+    g_raw = _to_int(request.args.get("g"))
+    b_raw = _to_int(request.args.get("b"))
+    r = clamp(255 if r_raw is None else r_raw, 0, 255)
+    g = clamp(255 if g_raw is None else g_raw, 0, 255)
+    bl = clamp(255 if b_raw is None else b_raw, 0, 255)
+    rgb_value = (r << 16) | (g << 8) | bl
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
-    for n in names:
-        b = BULBS.get(n)
-        if not b: continue
-        b.set_rgb(r, g, bl)
-        update_persisted(n, {"rgb": [r, g, bl], "color_mode": 1})
-    return jsonify({"ok": True})
+    wake_raw = (request.args.get("wake") or "1").strip().lower()
+    wake = wake_raw not in ("0", "false", "no", "off")
+    retries_raw = _to_int(request.args.get("retries"))
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+
+    def _op(name):
+        woke = False
+        if wake:
+            st = get_persisted(name) or {}
+            if st.get("power") == "off":
+                ok, err = _send_command_once(name, "set_power", ["on", "sudden", 0])
+                if not ok:
+                    # Fallback for bulbs that are reachable but flaky on raw sockets.
+                    b = BULBS.get(name)
+                    if not b:
+                        return False, err
+                    try:
+                        b.turn_on()
+                    except Exception:
+                        return False, err
+                woke = True
+                if COLOR_WAKE_DELAY_SEC > 0:
+                    time.sleep(COLOR_WAKE_DELAY_SEC)
+        ok, err = _send_command_once(name, "set_rgb", [rgb_value, "sudden", 0])
+        if ok:
+            return True, None
+
+        # Last fallback for stubborn bulbs while preserving bounded retries.
+        b = BULBS.get(name)
+        if not b:
+            return False, err
+        try:
+            if wake and not woke:
+                b.turn_on()
+                if COLOR_WAKE_DELAY_SEC > 0:
+                    time.sleep(COLOR_WAKE_DELAY_SEC)
+            b.set_rgb(r, g, bl)
+            return True, None
+        except Exception:
+            return False, err
+
+    success, errors = _apply_targets(
+        names,
+        "rgb",
+        _op,
+        retries=retries,
+        retry_delay=CONTROL_RETRY_DELAY_SEC,
+        refresh_ip=True,
+    )
+    for n in success:
+        patch = {"rgb": [r, g, bl], "color_mode": 1}
+        if wake:
+            patch["power"] = "on"
+        update_persisted(n, patch)
+    invalidate_state_cache()
+    return jsonify({"ok": len(errors) == 0, "applied": len(success), "failed": len(errors), "errors": errors})
 
 @app.route("/api/toggle/<target>", methods=["POST"])
 def toggle(target):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
-    for n in names:
-        b = BULBS.get(n)
-        if not b: continue
-        b.toggle()
+    retries_raw = _to_int(request.args.get("retries"))
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+
+    def _op(name):
+        return _send_command_once(name, "toggle", [])
+
+    success, errors = _apply_targets(
+        names,
+        "toggle",
+        _op,
+        retries=retries,
+        retry_delay=CONTROL_RETRY_DELAY_SEC,
+        refresh_ip=True,
+    )
+    for n in success:
         prev = get_persisted(n)
         if prev and prev.get("power") in ("on", "off"):
             update_persisted(n, {"power": "off" if prev.get("power") == "on" else "on"})
-    return jsonify({"ok": True})
+    invalidate_state_cache()
+    return jsonify({"ok": len(errors) == 0, "applied": len(success), "failed": len(errors), "errors": errors})
 
 # Quick animation demo using Flow (works on color bulbs)
 @app.route("/api/pulse/<target>", methods=["POST"])
@@ -686,27 +1173,29 @@ def pulse(target):
         b = BULBS.get(n)
         if not b: continue
         b.start_flow(f)
+    invalidate_state_cache()
     return jsonify({"ok": True})
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
+    global CONFIG
     new_cfg = build_config()
+    CONFIG = new_cfg
+    BULBS.clear()
+    invalidate_state_cache()
     return jsonify({"ok": True, "count": len(new_cfg), "names": list(new_cfg.keys())})
 
 @app.route("/api/state", methods=["GET"])
 def state_all():
-    out = {}
-    for name in CONFIG.keys():
-        st = read_state_for(name)
-        if st is not None:
-            out[name] = st
-    return jsonify(out)
+    return jsonify(_refresh_state_snapshot(force=False))
 
 @app.route("/api/state/<target>", methods=["GET"])
 def state_target(target):
+    snapshot = _refresh_state_snapshot(force=False)
+
     # single bulb
     if target in CONFIG:
-        st = read_state_for(target)
+        st = read_state_for(target, snapshot=snapshot)
         return jsonify({target: st} if st else {})
 
     # group aggregate (tri-state info + member states)
@@ -717,7 +1206,7 @@ def state_target(target):
         all_on = True
         any_unknown = False
         for m in members:
-            st = read_state_for(m)
+            st = read_state_for(m, snapshot=snapshot)
             states[m] = st
             if not st or st.get("power") not in ("on", "off"):
                 any_unknown = True
@@ -742,7 +1231,7 @@ def presence_get():
 @app.route("/api/presence", methods=["POST"])
 def presence_set():
     payload = request.get_json(silent=True) or {}
-    allowed = {"enabled", "device_name", "start_time", "end_time", "target", "routine", "poll_interval_sec", "cooldown_sec"}
+    allowed = {"enabled", "device_name", "device_mac", "device_iface", "start_time", "end_time", "target", "routine", "poll_interval_sec", "cooldown_sec"}
     with PRESENCE_LOCK:
         for key in allowed:
             if key in payload:
