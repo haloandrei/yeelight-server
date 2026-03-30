@@ -54,10 +54,12 @@ COMMAND_PORT = max(1, _env_int("YEE_PORT", 55443))
 CONTROL_RETRY_DELAY_SEC = max(0.05, _env_int("CONTROL_RETRY_DELAY_MS", 320) / 1000.0)
 POWER_BURST_GAP_SEC = max(0.01, _env_int("POWER_BURST_GAP_MS", 180) / 1000.0)
 COLOR_WAKE_DELAY_SEC = max(0.02, _env_int("COLOR_WAKE_DELAY_MS", 180) / 1000.0)
+POWER_OFF_GUARD_SEC = max(0.0, _env_int("POWER_OFF_GUARD_MS", 2500) / 1000.0)
 
 STATE_CACHE = {"at": 0.0, "data": {}}
 BULB_LOCKS = {}
 COMMAND_BACKOFF_UNTIL = {}
+POWER_OFF_GUARD_UNTIL = {}
 APPLY_EXECUTOR = ThreadPoolExecutor(max_workers=ACTION_WORKERS)
 
 def _cmd_output(cmd):
@@ -548,6 +550,29 @@ def _set_quota_backoff(name):
     with COMMAND_BACKOFF_LOCK:
         COMMAND_BACKOFF_UNTIL[name] = time.time() + COMMAND_QUOTA_BACKOFF_SEC
 
+def _set_power_off_guard(names):
+    if POWER_OFF_GUARD_SEC <= 0:
+        return
+    until = time.time() + POWER_OFF_GUARD_SEC
+    with COMMAND_BACKOFF_LOCK:
+        for name in names:
+            POWER_OFF_GUARD_UNTIL[name] = until
+
+def _clear_power_off_guard(names):
+    with COMMAND_BACKOFF_LOCK:
+        for name in names:
+            POWER_OFF_GUARD_UNTIL.pop(name, None)
+
+def _power_off_guard_active(name):
+    now = time.time()
+    with COMMAND_BACKOFF_LOCK:
+        until = POWER_OFF_GUARD_UNTIL.get(name, 0.0)
+        if until <= now:
+            if name in POWER_OFF_GUARD_UNTIL:
+                POWER_OFF_GUARD_UNTIL.pop(name, None)
+            return False
+        return True
+
 def _discovery_state_from_caps(caps):
     if not isinstance(caps, dict):
         return None
@@ -762,6 +787,8 @@ def _run_with_retry(name, action_name, op, retries=1, retry_delay=0.05, refresh_
         if ok:
             return True, None
         last_error = str(err or "unknown_error")
+        if "suppressed_after_off" in last_error.lower():
+            return False, last_error
         print(f"[warn] {action_name} error target={name} attempt={attempt}/{attempts}: {last_error}")
         if attempt < attempts:
             err_low = last_error.lower()
@@ -1067,6 +1094,10 @@ def power(target, state):
     retries_raw = _to_int(request.args.get("retries"))
     burst = clamp(1 if burst_raw is None else burst_raw, 1, 3)
     retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    if is_on:
+        _clear_power_off_guard(names)
+    else:
+        _set_power_off_guard(names)
 
     def _op(name):
         for i in range(burst):
@@ -1093,6 +1124,7 @@ def power(target, state):
         update_persisted(n, {"power": "on" if is_on else "off"})
     invalidate_state_cache()
     if not is_on:
+        _set_power_off_guard(names)
         stop_routines_for_targets(names)
     return jsonify({
         "ok": len(errors) == 0,
@@ -1113,6 +1145,8 @@ def bright(target):
     retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
 
     def _op(name):
+        if _power_off_guard_active(name):
+            return False, "suppressed_after_off"
         return _send_command_once(name, "set_bright", [val, "sudden", 0])
 
     success, errors = _apply_targets(
@@ -1138,6 +1172,8 @@ def ct(target):
     retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
 
     def _op(name):
+        if _power_off_guard_active(name):
+            return False, "suppressed_after_off"
         return _send_command_once(name, "set_ct_abx", [k, "sudden", 0])
 
     success, errors = _apply_targets(
@@ -1170,6 +1206,8 @@ def rgb(target):
     retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
 
     def _op(name):
+        if _power_off_guard_active(name):
+            return False, "suppressed_after_off"
         woke = False
         if wake:
             st = get_persisted(name) or {}
@@ -1229,6 +1267,8 @@ def toggle(target):
     retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
 
     def _op(name):
+        if _power_off_guard_active(name):
+            return False, "suppressed_after_off"
         return _send_command_once(name, "toggle", [])
 
     success, errors = _apply_targets(
