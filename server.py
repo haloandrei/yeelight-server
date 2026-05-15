@@ -1145,6 +1145,7 @@ def power(target, state):
         _clear_power_off_guard(names)
     else:
         _set_power_off_guard(names)
+        stop_routines_for_targets(names)
 
     def _op(name):
         for i in range(burst):
@@ -1172,7 +1173,6 @@ def power(target, state):
     invalidate_state_cache()
     if not is_on:
         _set_power_off_guard(names)
-        stop_routines_for_targets(names)
     return jsonify({
         "ok": len(errors) == 0,
         "applied": len(success),
