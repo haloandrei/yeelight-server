@@ -55,6 +55,7 @@ CONTROL_RETRY_DELAY_SEC = max(0.05, _env_int("CONTROL_RETRY_DELAY_MS", 320) / 10
 POWER_BURST_GAP_SEC = max(0.01, _env_int("POWER_BURST_GAP_MS", 180) / 1000.0)
 COLOR_WAKE_DELAY_SEC = max(0.02, _env_int("COLOR_WAKE_DELAY_MS", 180) / 1000.0)
 POWER_OFF_GUARD_SEC = max(0.0, _env_int("POWER_OFF_GUARD_MS", 2500) / 1000.0)
+ROUTINE_STEP_SEC = max(2, _env_int("ROUTINE_STEP_SEC", 5))
 
 STATE_CACHE = {"at": 0.0, "data": {}}
 BULB_LOCKS = {}
@@ -311,16 +312,22 @@ DEFAULT_ROUTINES = {
         "duration_min": 30,
         "start_bright": 80,
         "end_bright": 10,
-        "start_ct": 3500,
-        "end_ct": 2200,
+        "start_ct": 3000,
+        "end_ct": 1900,
+        "mode": "rgb",
+        "start_rgb": [255, 132, 36],
+        "end_rgb": [255, 76, 12],
     },
     "wake": {
         "target": "all",
         "duration_min": 30,
         "start_bright": 10,
         "end_bright": 100,
-        "start_ct": 2200,
-        "end_ct": 5000,
+        "start_ct": 1900,
+        "end_ct": 4200,
+        "mode": "rgb",
+        "start_rgb": [160, 18, 8],
+        "end_rgb": [255, 116, 42],
     },
     "boost": {
         "target": "all",
@@ -329,6 +336,9 @@ DEFAULT_ROUTINES = {
         "end_bright": 100,
         "start_ct": 2700,
         "end_ct": 6000,
+        "mode": "ct",
+        "start_rgb": [255, 120, 40],
+        "end_rgb": [255, 255, 255],
     },
 }
 
@@ -825,6 +835,40 @@ def _apply_targets(names, action_name, op, retries=1, retry_delay=0.05, refresh_
             errors.append({"target": n, "error": str(e)})
     return success, errors
 
+def _lerp_int(start, end, t):
+    return int(round(start + (end - start) * t))
+
+def _rgb_to_int(rgb):
+    normalized = _normalize_rgb(rgb) or [255, 255, 255]
+    return (normalized[0] << 16) | (normalized[1] << 8) | normalized[2]
+
+def _lerp_rgb(start, end, t):
+    start_rgb = _normalize_rgb(start) or [255, 120, 40]
+    end_rgb = _normalize_rgb(end) or start_rgb
+    return [_lerp_int(start_rgb[i], end_rgb[i], t) for i in range(3)]
+
+def _routine_step_values(cfg, t):
+    start_bright = clamp(_to_int(cfg.get("start_bright")) or 1, 1, 100)
+    end_bright = clamp(_to_int(cfg.get("end_bright")) or 1, 1, 100)
+    bright = clamp(_lerp_int(start_bright, end_bright, t), 1, 100)
+    mode = str(cfg.get("mode") or "ct").lower()
+    if mode == "rgb":
+        rgb = _lerp_rgb(cfg.get("start_rgb"), cfg.get("end_rgb"), t)
+        return {
+            "method": "set_scene",
+            "params": ["color", _rgb_to_int(rgb), bright],
+            "persist": {"power": "on", "bright": bright, "rgb": rgb, "color_mode": 1},
+        }
+
+    start_ct = clamp(_to_int(cfg.get("start_ct")) or 1700, 1700, 6500)
+    end_ct = clamp(_to_int(cfg.get("end_ct")) or 1700, 1700, 6500)
+    ct = clamp(_lerp_int(start_ct, end_ct, t), 1700, 6500)
+    return {
+        "method": "set_scene",
+        "params": ["ct", ct, bright],
+        "persist": {"power": "on", "bright": bright, "ct": ct, "color_mode": 2},
+    }
+
 def _routine_targets(target):
     if not target or target == "all":
         return list(CONFIG.keys())
@@ -839,34 +883,37 @@ def _routine_worker(name, cfg, cancel_event):
         ROUTINES_STATUS["running_targets"][name] = targets
         duration_min = _to_int(cfg.get("duration_min")) or 30
         duration_sec = max(60, duration_min * 60)
-        steps = max(1, int(duration_sec))
-        interval = 1
-
-        start_bright = clamp(_to_int(cfg.get("start_bright")) or 1, 1, 100)
-        end_bright = clamp(_to_int(cfg.get("end_bright")) or 1, 1, 100)
-        start_ct = clamp(_to_int(cfg.get("start_ct")) or 1700, 1700, 6500)
-        end_ct = clamp(_to_int(cfg.get("end_ct")) or 1700, 1700, 6500)
+        interval = ROUTINE_STEP_SEC
+        steps = max(2, int(duration_sec / interval) + 1)
 
         for i in range(steps):
             if cancel_event.is_set():
                 break
             t = i / (steps - 1) if steps > 1 else 1
-            bright = int(round(start_bright + (end_bright - start_bright) * t))
-            ct = int(round(start_ct + (end_ct - start_ct) * t))
-            for n in targets:
-                b = BULBS.get(n)
-                if not b:
-                    continue
-                try:
-                    if cancel_event.is_set():
-                        break
-                    b.turn_on()
-                    b.set_brightness(bright)
-                    b.set_color_temp(ct)
-                    update_persisted(n, {"power": "on", "bright": bright, "ct": ct, "color_mode": 2})
-                except Exception as e:
-                    print(f"[warn] routine error for {name}:{n} {e}")
-            time.sleep(interval)
+            step = _routine_step_values(cfg, t)
+
+            def _op(target_name):
+                if cancel_event.is_set():
+                    return False, "cancelled"
+                if _power_off_guard_active(target_name):
+                    return False, "suppressed_after_off"
+                return _send_command_once(target_name, step["method"], step["params"])
+
+            success, errors = _apply_targets(
+                targets,
+                f"routine:{name}",
+                _op,
+                retries=1,
+                retry_delay=0,
+                refresh_ip=False,
+            )
+            for n in success:
+                update_persisted(n, dict(step["persist"]))
+            for err in errors:
+                if err.get("error") != "cancelled":
+                    print(f"[warn] routine error for {name}:{err.get('target')} {err.get('error')}")
+            if i < steps - 1 and cancel_event.wait(interval):
+                break
     finally:
         ROUTINES_STATUS["running"][name] = False
         ROUTINES_STATUS["running_targets"][name] = []
@@ -1092,8 +1139,8 @@ def power(target, state):
     is_on = (state == "on")
     burst_raw = _to_int(request.args.get("burst"))
     retries_raw = _to_int(request.args.get("retries"))
-    burst = clamp(1 if burst_raw is None else burst_raw, 1, 3)
-    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    burst = clamp(1 if burst_raw is None else burst_raw, 1, 2)
+    retries = clamp(2 if retries_raw is None else retries_raw, 1, 3)
     if is_on:
         _clear_power_off_guard(names)
     else:
@@ -1142,7 +1189,7 @@ def bright(target):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
     retries_raw = _to_int(request.args.get("retries"))
-    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    retries = clamp(1 if retries_raw is None else retries_raw, 1, 2)
 
     def _op(name):
         if _power_off_guard_active(name):
@@ -1169,7 +1216,7 @@ def ct(target):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
     retries_raw = _to_int(request.args.get("retries"))
-    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    retries = clamp(1 if retries_raw is None else retries_raw, 1, 2)
 
     def _op(name):
         if _power_off_guard_active(name):
@@ -1203,7 +1250,7 @@ def rgb(target):
     wake_raw = (request.args.get("wake") or "1").strip().lower()
     wake = wake_raw not in ("0", "false", "no", "off")
     retries_raw = _to_int(request.args.get("retries"))
-    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    retries = clamp(1 if retries_raw is None else retries_raw, 1, 2)
 
     def _op(name):
         if _power_off_guard_active(name):
@@ -1264,7 +1311,7 @@ def toggle(target):
     names = names_or_group(target)
     if not names: return jsonify({"error":"unknown target"}), 404
     retries_raw = _to_int(request.args.get("retries"))
-    retries = clamp(2 if retries_raw is None else retries_raw, 1, 4)
+    retries = clamp(1 if retries_raw is None else retries_raw, 1, 2)
 
     def _op(name):
         if _power_off_guard_active(name):
@@ -1319,11 +1366,13 @@ def api_scan():
 
 @app.route("/api/state", methods=["GET"])
 def state_all():
-    return jsonify(_refresh_state_snapshot(force=False))
+    fresh = str(request.args.get("fresh") or "").strip().lower() in ("1", "true", "yes", "on")
+    return jsonify(_refresh_state_snapshot(force=fresh))
 
 @app.route("/api/state/<target>", methods=["GET"])
 def state_target(target):
-    snapshot = _refresh_state_snapshot(force=False)
+    fresh = str(request.args.get("fresh") or "").strip().lower() in ("1", "true", "yes", "on")
+    snapshot = _refresh_state_snapshot(force=fresh)
 
     # single bulb
     if target in CONFIG:
@@ -1403,7 +1452,12 @@ def routines_set():
 @app.route("/api/routine/<name>/start", methods=["POST"])
 def routine_start(name):
     target = request.args.get("target")
-    override = {"target": target} if target else None
+    payload = request.get_json(silent=True) or {}
+    override = payload if isinstance(payload, dict) else {}
+    if target:
+        override["target"] = target
+    if not override:
+        override = None
     ok = start_routine(name, override)
     if not ok:
         return jsonify({"error": "unable to start"}), 400
